@@ -1,0 +1,124 @@
+#include "imports/stdlib.fc";
+
+const err:OLD_SEQNO = 119;
+const err:WRONG_SIGNATURE = 120;
+const err:LOCKED_FOR_NOT_POSITIVE = 121;
+const err:TOO_LATE = 122;
+const err:NOT_DEFERRAL = 123;
+
+const err:TOO_EARLY = 124;
+
+const op:lock = 0x9df10277;
+const op:inherit = 0xbb4be234;
+
+() lock(slice in_msg_body) impure inline {
+    slice ds = get_data().begin_parse();
+
+    int public_key = ds~load_uint(256);
+    int execution_time = ds~load_uint(32);
+    slice receiver = ds~load_msg_addr();
+    int seqno = ds.preload_uint(32);
+
+    cell data = in_msg_body.preload_ref();
+
+    slice s = data.begin_parse();
+    int locked_for = s~load_uint(32);
+    int new_seqno = s.preload_uint(32);
+
+    throw_if(err:OLD_SEQNO, new_seqno != seqno + 1);
+    throw_unless(
+        err:WRONG_SIGNATURE,
+        check_signature(
+            cell_hash(data),
+            in_msg_body,
+            public_key
+        )
+    );
+    throw_unless(err:LOCKED_FOR_NOT_POSITIVE, locked_for);
+    throw_if(err:TOO_LATE, execution_time < now());
+    int new_execution_time = now() + locked_for;
+    throw_if(err:NOT_DEFERRAL, new_execution_time <= execution_time);
+
+    ;; Need to accept external message before changing contract's storage
+    ;; https://docs.ton.org/develop/smart-contracts/guidelines/accept
+    accept_message();
+
+    set_data(
+        begin_cell()
+            .store_uint(public_key, 256)
+            .store_uint(new_execution_time, 32)
+            .store_slice(receiver)
+            .store_uint(new_seqno, 32)
+        .end_cell()
+    );
+}
+
+() inherit(int query_id) impure inline {
+    ;; Get contract's data as slice and skip signature, as its not needed.
+    slice data = get_data().begin_parse().skip_bits(256);
+
+    int execution_time = data~load_uint(32);
+    ;; Discard the rest of the slice as it's not needed anymore.
+    (_, slice receiver) = data.load_msg_addr();
+
+    throw_if(err:TOO_EARLY, now() < execution_time);
+
+    ;; Need to accept external message before sending internal messages
+    ;; https://docs.ton.org/develop/smart-contracts/guidelines/accept
+    accept_message();
+
+    ;; Explaining message boilerplate:
+    ;; https://docs.ton.org/develop/smart-contracts/messages
+    var msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(receiver)
+        .store_uint(0, 4 + 1 + 4 + 4 + 64 + 32 + 1 + 1 + 32)
+        ;; It's hard to find information on query_id,
+        ;; but basically it is what it's called,
+        ;; and it should be forwarded
+        ;; with messages the contract makes.
+        ;; That's the convention.
+        ;; I didn't test it in this contest,
+        ;; but `query_id` did matter in Tact challenge.
+        .store_uint(query_id, 64)
+    .end_cell();
+
+    send_raw_message(
+            msg,
+            128
+    );
+}
+
+() recv_external(slice in_msg_body) impure {
+    int op = in_msg_body~load_uint(32);
+    if (op == op:lock) {
+        lock(in_msg_body.skip_bits(64));
+    } elseif (op == op:inherit) {
+        ;; Use preload,
+        ;; because it does not return the slice remainder,
+        ;; and I don't need it.
+        ;; If I used load-,
+        ;; there could potentially be extra stack-manipulation instructions.
+        ;; Which would increase gas usage.
+        inherit(in_msg_body.preload_uint(64));
+    }
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+}
+
+int get_seqno() method_id {
+    return get_data()
+        .begin_parse()
+        .slice_last(32)
+        .preload_uint(32);
+}
+
+int get_execution_time() method_id {
+    return get_data()
+        .begin_parse()
+        ;; Skip signature
+        .skip_bits(256)
+        ;; Get `execution_time`
+        .preload_uint(32);
+}

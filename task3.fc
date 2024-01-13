@@ -1,0 +1,238 @@
+#include "imports/stdlib.fc";
+;; All the code in recv_internal, get_storage, wrap_storage, and version
+;; serves as an example of the intended structure.
+
+;; The provided code is an "empty wrapper." It:
+;; + Parses "wrapped" incoming messages (discards versioning information)
+;; + "Wraps" the call to the version-specific process_message
+;; + Implements "get_storage" for version-specific get-methods
+;; However, it does not yet implement any upgrade logic, which is your task.
+
+;; The empty wrapper is provided to demonstrate
+;; how version-specific code is intended to be "wrapped" and interacted with.
+;; You may delete and rewrite as needed,
+;; but the final implementation must adhere to the same structure
+
+{-
+    The above is the original template description.
+
+    I think the most confusing thing about this task is:
+    What's the structure of code that the contract receives?
+    This is mostly for local testing, but is also an interesting question.
+
+    `new_code` is of course the entire contract with `process_message` changed,
+    for `migration_code` it was quite confusing for me.
+    Would it contain just one function `migrate_one`?
+    After attempting to test this task locally I've learnt a lot.
+    Every function has a certain id,
+    all functions are stored in the c3 register as a dictionary,
+    with id being the key.
+    So, at compile time,
+    when `migrate_one` is called,
+    the call is dependent on its id.
+    The id can vary depending on the amount of functions and their order.
+    So, based on that,
+    the `migration_code` should have the same code structure
+    as the current contract.
+    That's why `migrate_one` is within the <<<<< >>>>> replaceable part of the code.
+    It might not have the same code in the functions as the contract generally,
+    but it does not matter since c3 is set to `new_code` right after migration.
+    In tests, however, `migration_code` does have the same code.
+    If `migration_code` only had the same function structure but different function bodies,
+    and calling other functions would be needed,
+    c3 can be reset:
+    ```
+    cont c3 = get_c3();
+    set_c3(migration_code);
+    storage = migrate_one(storage);
+    set_c3(c3);
+    ```
+
+    As a conclusion:
+    it's really important to not change the order
+    and amount of function definitions of the template,
+    because otherwise tests will break.
+    (udict_get doesn't count because it's an asm function that's hardcoded at compile time)
+
+    Also, I do not use `wrap_storage` at all,
+    because hard coding consumes less gas
+    than calling a function.
+-}
+
+(slice, int) udict_get(cell dict, int key_len, int index) asm(index dict key_len) "DICTUGET";
+
+;; This function is explained later in the code.
+(
+    slice,
+    cell,
+    int
+) change_stack(
+    int expected_version,
+    cell new_code,
+    cell migrations,
+    slice payload,
+    cell storage,
+    int version
+) impure asm """
+s4 s0 XCPU
+2 4 BLKDROP2
+SETCODE
+CTOS
+BLESS
+c3 POP
+ROT
+""";
+
+const err:NO_CODE = 200;
+const err:NO_MIGRATION = 400;
+
+const key_len = 32;
+
+() recv_internal(int msg_value, int balance, cell in_msg_full, slice in_msg_body) impure {
+    int expected_version = in_msg_body~load_uint(32);
+
+    ;; This is the first call with `expected version == 0`
+    ;; to initialize the contract properly.
+    ;;
+    ;; In FunC booleans are just ints,
+    ;; where 0 is false and any other value is true.
+    ;; (although conventionally -1 is used for true)
+    ;; So using `ifnot` can save an unneeded comparison instruction.
+    ifnot expected_version {
+        begin_cell()
+            .store_uint(1, 32)
+            .store_ref(get_data())
+        .end_cell()
+        .set_data();
+        return ();
+    }
+
+    cell new_code = in_msg_body~load_maybe_ref();
+    cell migrations = in_msg_body~load_dict();
+    ;; Use preload,
+    ;; because it does not return the slice remainder,
+    ;; and I don't need it.
+    ;; If I used load-,
+    ;; there could potentially be extra stack-manipulation instructions.
+    ;; Which would increase gas usage.
+    slice payload = in_msg_body.preload_ref().begin_parse();
+
+    slice ds = get_data().begin_parse();
+    cell storage = ds~load_ref();
+    int version = ds.preload_uint(32);
+
+    if version != expected_version {
+        throw_if(err:NO_CODE, new_code.null?());
+
+        do {
+            ;; `udict_get?` does 2 instructions:
+            ;; DICTUGET NULLSWAPIFNOT
+            ;; Proper documentation can be looked up here:
+            ;; https://docs.ton.org/learn/tvm-instructions/instructions#quick-search
+            ;; But basically:
+            ;; if the key is not present in the dictionary,
+            ;; DICTUGET will only return the 0/false success flag,
+            ;; NULLSWAPIFNOT will put null under the flag in the stack if flag is 0/false.
+            ;; However, I need to throw if success flag is 0/false anyway.
+            ;; So I use a custom asm function that only calls DICTUGET.
+            ;; This eliminates NULLSWAPIFNOT, so the gas usage is a bit better.
+            ;; This improved gas usage by 0.0011 points.
+            (slice migration, int success) = migrations.udict_get(key_len, version);
+
+            throw_unless(err:NO_MIGRATION, success);
+
+            version = migration~load_uint(32);
+            cell migration_code = migration.preload_maybe_ref();
+            ifnot migration_code.null?() {
+                migration_code
+                    .begin_parse()
+                    .bless()
+                    .set_c3();
+
+                storage = migrate_one(storage);
+            }
+        } until version == expected_version;
+
+        (
+            payload,
+            storage,
+            version
+        ) = change_stack(
+            expected_version,
+            new_code,
+            migrations,
+            payload,
+            storage,
+            version
+        );
+        ;; Does the same as above, but consumes more gas:
+        ;; ```
+        ;; set_code(new_code);
+        ;; new_code
+        ;;     .begin_parse()
+        ;;     .bless()
+        ;;     .set_c3();
+        ;; ```
+        ;; This asm function improved gas by... 0.0002 points.
+        ;; I could've just not done this at all,
+        ;; but it was a good learning experience
+        ;; with low-level stack optimization.
+        ;; I noticed the compiler produced suboptimal stack manipulation instructions,
+        ;; and that's what this optimization is based on,
+        ;; so I spent a couple hours to find a slightly better way haha.
+    }
+
+    storage = process_message(
+        storage,
+        msg_value,
+        balance,
+        in_msg_full,
+        payload
+    );
+
+    begin_cell()
+        ;; I do `store_ref` first because
+        ;; it's closer on the stack,
+        ;; and it's being removed from the stack.
+        ;; So arranging `version` on the stack later is cheaper.
+        .store_ref(storage)
+        .store_uint(version, 32)
+    .end_cell()
+    .set_data();
+}
+
+cell get_storage() {
+    return get_data().begin_parse().preload_ref();
+}
+
+cell wrap_storage(int version_id, cell storage) {
+    ;; add additional data required for versioning in this cell
+    return begin_cell()
+        .store_ref(storage)
+        .store_uint(version_id, 32)
+    .end_cell();
+}
+
+;; Return the current version of the smart contract
+int version() method_id {
+    return get_data().begin_parse().preload_uint(32);
+}
+
+;; <<<<< Custom version-specific code begins
+;; This section (everything between << and >> characters) will be fully substituted for each version.
+;; This is an IMPORTANT part, and these exact lines with <<<<< and >>>>> must be present in your code for the testing system to work correctly.
+;; All the code provided here serves as an example of the version-code, which your update code must be compatible with.
+;; Refer to the "3-example" directory for more version examples.
+
+;; from counter-v0.fc
+cell process_message(cell storage, int msg_value, int balance, cell in_msg_full, slice in_msg_body) impure {
+    slice cs = storage.begin_parse();
+    int current_amount = cs.preload_uint(32);
+    return begin_cell().store_uint(current_amount + 1, 32).end_cell();
+}
+
+cell migrate_one(cell old_storage) { ;; it's just a placeholder that is required for correct compilation
+    return old_storage;
+}
+
+;; Custom version-specific code ends >>>>>

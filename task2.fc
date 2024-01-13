@@ -1,0 +1,255 @@
+#include "imports/stdlib.fc";
+
+const err:NOT_ADMIN = 120;
+const err:NOT_IN_STORAGE = 121;
+const err:NO_USERS = 122;
+
+const op:add_user = 0x368ddef3;
+const op:remove_user = 0x278205c8;
+const op:split = 0x068530b3;
+const op:transfer_notification = 0x7362d09c;
+
+const key_len = 256;
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    ;; For some reason tests send invalid messages.
+    ;; If I were to guess it is to give the contract ton for gas,
+    ;; since in both splits the contract's balance pays for gas.
+    if (in_msg_body.slice_bits() < 32) {
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+    if op == op:add_user {
+        ;; Start parsing the full incoming message.
+        ;; I need this message to get the sender.
+        slice msg = in_msg_full.begin_parse();
+        ;; Skip unneeded information:
+        ;; https://docs.ton.org/develop/data-formats/msg-tlb#int_msg_info0
+        msg~skip_bits(4);
+
+        slice data = get_data().begin_parse();
+        slice admin_address = data~load_msg_addr();
+
+        throw_unless(
+            err:NOT_ADMIN,
+            equal_slices(
+                admin_address,
+                ;; Sender address.
+                msg~load_msg_addr()
+            )
+        );
+
+        ;; Get the address bits from message body.
+        (_, int user) = in_msg_body~load_msg_addr().parse_std_addr();
+
+        ;; Use preload,
+        ;; because it does not return the slice remainder,
+        ;; and I don't need it.
+        ;; If I used load-,
+        ;; there could potentially be extra stack-manipulation instructions.
+        ;; Which would increase gas usage.
+        cell users = data.preload_dict();
+
+        ;; I'm not sure, but maybe `~udict_set_builder` would consume less gas?
+        users~udict_set(
+            key_len,
+            user,
+            begin_cell()
+                .store_uint(in_msg_body.preload_uint(32), 32)
+            .end_cell()
+            .begin_parse()
+        );
+
+        set_data(
+            begin_cell()
+                .store_slice(admin_address)
+                .store_dict(users)
+            .end_cell()
+        );
+    } elseif op == op:remove_user {
+        slice msg = in_msg_full.begin_parse();
+        msg~skip_bits(4);
+
+        slice data = get_data().begin_parse();
+        slice admin_address = data~load_msg_addr();
+
+        throw_unless(
+            err:NOT_ADMIN,
+            equal_slices(
+                admin_address,
+                msg~load_msg_addr()
+            )
+        );
+
+        (_, int user) = in_msg_body~load_msg_addr().parse_std_addr();
+
+        cell users = data.preload_dict();
+
+        int success = users~udict_delete?(key_len, user);
+        throw_unless(err:NOT_IN_STORAGE, success);
+
+        set_data(
+            begin_cell()
+                .store_slice(admin_address)
+                .store_dict(users)
+            .end_cell()
+        );
+    } elseif op == op:split {
+        ;; Skips the admin address.
+        ;; This works because `load_msg_addr` returns
+        ;; the remainder of the slice,
+        ;; and then the address.
+        ;; I simply discard the address after.
+        (slice data, _) = get_data().begin_parse().load_msg_addr();
+
+        cell users = data.preload_dict();
+        throw_if(err:NO_USERS, users.dict_empty?());
+
+        int total_share = 0;
+
+        cell users_tmp = users;
+
+        ;; This could be optimized by calculating the total share
+        ;; when users are added and removed and storing it in storage.
+        do {
+            ;; Ignore success flag, since this is guaranteed to always succeed
+            ;; Also ignore key since it's not needed.
+            (_, slice user_share, _) = users~udict::delete_get_min(key_len);
+
+            total_share += user_share.preload_uint(32);
+        } until users.dict_empty?();
+
+        users = users_tmp;
+
+        do {
+            ;; Ignore success flag, since this is guaranteed to always succeed
+            ;; Maybe this could be optimized by using `udict_get_next?`,
+            ;; since it doesn't need to mutate `users`?
+            (int user, slice user_share, _) = users~udict::delete_get_min(key_len);
+
+            cell msg = begin_cell()
+                ;; Similar shortcut to the jetton message below,
+                ;; but also with message boilerplate:
+                ;; https://docs.ton.org/develop/smart-contracts/messages
+                ;; 0xC400 = 1 1 0 00 10 0 00000000
+                ;; And because the above is 16 bits, but stored in 17,
+                ;; there will be a leading 0 on the left,
+                ;; which is what I need.
+                .store_uint(0xC400, 17)
+                .store_uint(user, 256)
+                .store_coins(muldiv(user_share.preload_uint(32), msg_value, total_share))
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 32)
+                ;; It's hard to find information on query_id,
+                ;; but basically it is what it's called,
+                ;; and it should be forwarded
+                ;; with messages the contract makes.
+                ;; That's the convention.
+                ;; I didn't test it in this contest,
+                ;; but `query_id` did matter in Tact challenge.
+                .store_uint(query_id, 64)
+            .end_cell();
+
+            send_raw_message(msg, 1);
+        } until users.dict_empty?();
+    } elseif op == op:transfer_notification {
+        (slice data, _) = get_data().begin_parse().load_msg_addr();
+
+        cell users = data.preload_dict();
+        throw_if(err:NO_USERS, users.dict_empty?());
+
+        int total_share = 0;
+
+        cell users_tmp = users;
+
+        do {
+            (_, slice user_share, _) = users~udict::delete_get_min(key_len);
+
+            total_share += user_share.preload_uint(32);
+        } until users.dict_empty?();
+
+        users = users_tmp;
+
+        int amount = in_msg_body~load_coins();
+        do {
+            (int user, slice user_share, _) = users~udict::delete_get_min(key_len);
+
+            ;; Message body for sending Jettons:
+            ;; https://github.com/ton-blockchain/TEPs/blob/master/text/0074-jettons-standard.md
+            builder body = begin_cell()
+                ;; op
+                .store_uint(0x0f8a7ea5, 32)
+                ;; query_id
+                .store_uint(query_id, 64)
+                ;; amount
+                .store_coins(muldiv(user_share.preload_uint(32), amount, total_share))
+                ;; destination
+                ;;
+                ;; Since workchain is always 0,
+                ;; I shortcut the address serialization:
+                ;; https://docs.ton.org/develop/func/stdlib/#address-manipulation-primitives
+                ;;        No anycast
+                ;;   addr_std | workchain
+                ;;         v  v    v
+                ;; 0x400 = 10 0 00000000
+                .store_uint(0x400, 11)
+                ;; And then store the actual address part.
+                .store_uint(user, 256)
+                ;; response_destination
+                .store_uint(0x400, 11)
+                .store_uint(user, 256)
+                ;; The next parts could also be shorter
+                ;; by calculating these constants and
+                ;; calling one `store_uint`
+                ;;
+                ;; custom_payload
+                .store_uint(0, 1)
+                ;; forward_ton_amount
+                .store_coins(1)
+                ;; forward_payload Either
+                .store_uint(0, 1);
+
+            slice jetton = in_msg_full.begin_parse();
+            ;; Get master Jetton contract address
+            (_, jetton) = jetton.skip_bits(4).load_msg_addr();
+
+            cell msg = begin_cell()
+                .store_uint(0x18, 6)
+                .store_slice(jetton)
+                .store_coins(20000000)
+                ;; All bits except the last one will be 0,
+                ;; the last bit will be 1,
+                ;; it specifies that the message's body
+                ;; will be in a reference and not in this slice.
+                ;; I do this because Jetton's message body
+                ;; does not fit in this cell directly.
+                ;; https://docs.ton.org/develop/smart-contracts/messages#message-layout
+                .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .store_ref(body.end_cell())
+            .end_cell();
+
+            send_raw_message(msg, 0);
+        } until users.dict_empty?();
+    }
+}
+
+cell get_users() method_id {
+    (slice data, _) = get_data().begin_parse().load_msg_addr();
+
+    return data.preload_dict();
+}
+
+int get_user_share(slice user_address) method_id {
+    (_, int user) = user_address.parse_std_addr();
+
+    (slice data, _) = get_data().begin_parse().load_msg_addr();
+
+    ;; Ignore success flag,
+    ;; because task description said
+    ;; "It is guaranteed that the user is in the storage."
+    (slice user_share, _) = data.preload_dict().udict_get?(key_len, user);
+
+    return user_share.preload_uint(32);
+}

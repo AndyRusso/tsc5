@@ -1,0 +1,533 @@
+#include "imports/stdlib.fc";
+int tlen(tuple t) asm "TLEN";
+;; Used for much cheaper tuple mutation.
+forall X -> (tuple, ()) set_index(tuple t, int index, X value) asm(t value index) "SETINDEXVAR";
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+
+}
+
+global int start_x;
+global int start_y;
+global int end_x;
+global int end_y;
+global int rows;
+global int columns;
+global tuple maze;
+global cell open;
+{-
+    Outdated name.
+    Matrix (tuple of tuples of ints)
+    representing final costs of every visited/expanded position in the maze.
+    Where final cost is according to the A* algorithm.
+    Initialized with all positions' costs as INTEGER_MAX, (except start which is 0)
+    to make the unexplored positions be unpreferrable,
+    and for generally making the implementation easier.
+    (no need to check if a position has been set before or not)
+
+    This awesome idea was taken from this solution:
+    https://github.com/justdmitry/tsc5
+-}
+global tuple closed;
+
+const START = "S"u;
+const END = "E"u;
+const OBSTACLE = "X"u;
+const SUPERPOSITION_OBSTACLE = "?"u;
+
+const INTEGER_MAX = 1 << 255;
+
+{-
+    Used to make the A* not prefer these nodes for the path.
+
+    The value should be big enough to force the algorithm
+    to rather go through the entire maze of free-spaces
+    than cross a single superposition/obstacle.
+
+    In this task the maximum size of the maze is 31x31,
+    so essentially this can be just 31 * 31 = 961 for superpositions,
+    and 961 * 31 * 31 = 923521 for the obstacles
+    since they're less preferrable than superpositions,
+    I have to account for an entire maze of superpositions too.
+
+    However, for simplicity, I set these to thousands.
+-}
+const int SUPERPOSITION_COST = 1000;
+const int OBSTACLE_COST = 1000 * 1000;
+
+{-
+    A priority queue^1 is crucial for an efficient A* implementation.
+    For A* the priority queue should return the lowest-priority elements first.
+
+    These constants are used for the dict-based priority queue.
+    with the, genius, implementation taken from this solution:
+    https://github.com/Mip182/tcs5
+    Dicts quite fit for a priority queue in TVM,
+    due to the "DICTUREMMIN" instruction^2,
+    which makes looking up and removing
+    the lowest cost element in the priority queue quite cheap.
+
+    My failed solution also tried using a dict-based priority queue,
+    an implementation idea shared in the TON Contests group.
+    However, I only stored the final cost in the key,
+    and the value was the appropirately serialized Nodes.
+    But this implementation falls short because of 2 reasons:
+        - Cell manipulation is very expensive.
+        - Nodes can have repeating final costs,
+        so my implementation had to account for iterating
+        through references containing all the Nodes
+        with the same final cost.
+        Combined with the failed implementation requiring
+        random access on the priority queue:
+        This priority queue implementation greatly increased the complexity
+        and had very large gas usage.
+
+    However, this implementation stores all the data in the key,
+    which completely eliminates cell manipulation
+    and handles duplicates appropriately.
+    Along with not requiring random access
+    in this version of the solution:
+    this is probably the perfect heap implementation.
+
+    Keys are simply 70 bit unsigned integers.
+    In this implementation the Final cost and G cost
+    can be stored in about 30 bits each.
+    Each coordinate can take up to 5 bits.
+    Because Final and G costs are the important parts for the algorithm,
+    the full 70 bit key is laid out like this: (in binary)
+
+              Final cost                       G cost               x     y
+    |----------------------------| |----------------------------| |---| |---|
+    000000000000000000000000000000 000000000000000000000000000000 00000 00000
+
+    This way, when the priority queue is being popped from,
+    it will first give the key with the lowest Final cost,
+    and if there're identical Final costs,
+    it'll give the key with the lowest G cost.
+    This logic can be extended to the coordinates,
+    but the algorithm doesn't care about
+    the order of coordinates with the same costs.
+
+    Pushing is simply setting a key with an empty slice as value.
+
+    And of course,
+    these keys can be composed via bit shifts and logical ORs/addition,
+    and decomposed with bit masks and bit shifts.
+    So... yeah, that's what these constants are for.
+
+    1 - https://wikipedia.org/wiki/Priority_queue
+    2 - https://docs.ton.org/learn/tvm-instructions/instructions/dictionary-manipulation#getmin-getmax-removemin-removemax-operations
+
+    As a footnote,
+    I'd like to talk about the tuple-based implementations of a
+    [heap](https://wikipedia.org/wiki/Heap_(data_structure))
+    It's probably the most conventional implementation
+    of priority queues and would look similar with other languages.
+    I tried implementing it,
+    and while it used more gas on 11/12 tests
+    than just looking through every element in a tuple,
+    I think I could've optimized it better,
+    or perhaps it'd take less gas on a bigger maze.
+    However, a tuple-based heap has one major limitation:
+    tuples in TVM are limited to 255 elements.
+    And in a 31x31 maze the `open` priority queue
+    most definitely can go over 255 elements.
+    So, unfortunately, this conventional solution
+    can not be applied in this task. 
+
+    The reason I implemented it while knowing the limitation
+    is because I imagined the `open` queue
+    would not grow over 255 elements,
+    because it should be constantly popped from,
+    so a maze that'd have 255 elements
+    in the `open` queue would have to be much bigger.
+    Well, I was wrong.
+    As a note, next time I should actually check,
+    if the known limitation is an issue in the task I'm solving,
+    and not go off approximations.
+
+    Another tuple-based implementation of a heap
+    that I personally came up with,
+    is a lisp-style-list-based heap.
+    I ended up not implementing it.
+    However, I think it's important to mention this
+    because - dicts are inherently expensive,
+    since they're smartly manipulated cells under the hood,
+    and the gas usage depends on the keys in a given dict.
+    But lisp-style-lists could be cheaper. Maybe...
+    While this data structure sounded very appealing
+    in my head, after putting it down on paper
+    and trying to figure out how to do pushes and pops,
+    I came to the conclusion that they're way too complicated
+    for me to attempt implementing with the limited time I had left.
+    But maybe someone could try? ;)
+    If anyone attempts, to save you some thinking:
+    one thing I for sure realized is that
+    a lisp-style-list of form:
+    (Node, (Node, (...)), (Node, (...)))
+    would be cheaper to operate on than the conventional:
+    (Node, ((Node, (...), (Node, (...)))))
+-}
+const int SHIFT_X = 5;
+const int SHIFT_G = SHIFT_X + 5;
+const int SHIFT_FINAL = SHIFT_G + 30;
+const slice FILLER = "";
+const key_len = 70;
+
+const int MASK_Y = (1 << 5) - 1;
+const int MASK_X = MASK_Y << SHIFT_X;
+const int MASK_G = (1 << 30) - 1 << SHIFT_G;
+const int MASK_FINAL = MASK_G << 30;
+
+(int, int) locate(int rows, int columns, tuple maze, int char) inline {
+    int row = 0;
+    repeat rows {
+        int column = 0;
+        repeat columns {
+            if maze.at(row).at(column) == char {
+                return (column, row);
+            }
+
+            column += 1;
+        }
+
+        row += 1;
+    }
+
+    return (-1, -1);
+}
+
+{-
+    The heuristic used for this maze is Chebyshev distance:
+    https://wikipedia.org/wiki/Chebyshev_distance .
+    This can be quite easily understood as the appropirate heuristic,
+    by looking at the provided examples of solved mazes
+    in the task description.
+
+    Another curious thing I've observed is why this formula is the way it is.
+    According to this article: 
+    https://theory.stanford.edu/~amitp/GameProgramming/Heuristics.html#diagonal-distance
+    The formula for Chebyshev distance could be:
+    heuristic = D * (dx + dy) + (D2 - 2 * D) * min(dx, dy)
+    But Wikipedia's is closer to my implementation.
+    Well, this equation can be transformed in our case:
+    heuristic = 1 * (dx + dy) + (1 - 2 * 1) * min(dx, dy)
+    heuristic = (dx + dy) - min(dx, dy)
+    heuristic = max(dx, dy)
+-}
+int heuristic(int node_x, int node_y) inline {
+    int dx = abs(node_x - end_x);
+    int dy = abs(node_y - end_y);
+
+    return max(dx, dy);
+}
+
+{-
+    The oh-so-simple priority queue implementation.
+    Looking back I notice that
+    calling this a heap is a bit technically incorrect.
+-}
+() heap_push(int x, int y, int g_cost, int final_cost) impure inline {
+    ;; Bit shifts: https://stackoverflow.com/q/141525
+    ;; Bitwise OR is used here basically as a plus: https://stackoverflow.com/q/7334832
+    int key = (final_cost << SHIFT_FINAL) | (g_cost << SHIFT_G) | (x << SHIFT_X) | y;
+
+    open~udict_set(key_len, key, FILLER);
+}
+
+{-
+    Notice how there are no checks if the queue is empty,
+    this is because, in this code in particular,
+    the program always returns
+    before `open` can be empty.
+-}
+(int, int, int, int) heap_pop() impure inline {
+    (int key, _, _) = open~udict::delete_get_min(key_len);
+
+    ;; The decomposing using bit masks and shifts.
+    ;; https://stackoverflow.com/q/10493411
+    int y = key & MASK_Y;
+    int x = key & MASK_X >> SHIFT_X;
+    int g_cost = key & MASK_G >> SHIFT_G;
+    int final_cost = key & MASK_FINAL >> SHIFT_FINAL;
+
+    return (x, y, g_cost, final_cost);
+}
+
+int in_bounds?(int x, int y) inline {
+    return (min(x, y) >= 0) & (x < columns) & (y < rows);
+}
+
+() _neighbor(int x, int y, int g_cost) impure inline {
+    if in_bounds?(x, y) {
+        int char = maze.at(y).at(x);
+
+        if char == OBSTACLE {
+            char = OBSTACLE_COST;
+        } elseif char == SUPERPOSITION_OBSTACLE {
+            char = SUPERPOSITION_COST;
+        } else {
+            char = 0;
+        }
+
+        char += g_cost;
+        int final_cost = char + heuristic(x, y);
+
+        if final_cost < closed.at(y).at(x) {
+            ;; Change cost in the closed matrix
+            tuple row = closed.at(y);
+            row~set_index(x, final_cost);
+            closed~set_index(y, row);
+
+            ;; If this Node shaved a cost,
+            ;; I need to go over its neighbors again
+            ;; to recalculate the costs.
+            ;; This both adds new unexplored Nodes,
+            ;; and recalculates already explored ones.
+            heap_push(x, y, char, final_cost);
+        }
+    }
+}
+
+{-
+    Collecting and marking the final path.
+    This is also part of justdmitry's solution:
+    https://github.com/justdmitry/tsc5
+
+    What this does is:
+    - looks at every neighbor of the end position.
+    - picks the neighbor with the lowest Final cost.
+        - If cost is 0 it means it has found the start position.
+        The changed maze is returned.
+        - If the costs match, then pick the one closest to the start.
+        As it doesn't have the information about the G cost,
+        it simply calculates the heuristic and picks the
+        neighbor with the highest heuristic value.
+        Because:
+        Final cost = G cost + heuristic
+        G cost = Final cost - heuristic
+        Bigger heuristic = smaller G cost
+    - marks the position of the picked neighbor in the maze with a "!"
+    - iterates with the picked neighbor until it finds the start.
+
+    This is implemented in a bit of a weird way,
+    as I wanted to reuse my neighbor exploring code.
+-}
+tuple solved_maze() {
+    tuple maze' = maze;
+
+    int x = end_x;
+    int y = end_y;
+
+    ;; I could pass the actual Final cost
+    ;; of the end coordinates in arguments,
+    ;; but there's practically no reason to.
+    int last_cost = INTEGER_MAX;
+
+    while true {
+        int temp_x = x - 1;
+        int temp_y = y - 1;
+
+        repeat 3 {
+            if in_bounds?(temp_x, temp_y) {
+                int temp_cost = closed.at(temp_y).at(temp_x);
+
+                ;; In FunC booleans are just ints,
+                ;; where 0 is false and any other value is true.
+                ;; (although conventionally -1 is used for true)
+                ;; So using `ifnot` can save an unneeded comparasion instruction.
+                ifnot temp_cost {
+                    return maze';
+                } elseif temp_cost < last_cost {
+                    last_cost = temp_cost;
+
+                    x = temp_x;
+                    y = temp_y;
+               } elseif (temp_cost == last_cost) & (heuristic(temp_x, temp_y) > heuristic(x, y)) {
+                    last_cost = temp_cost;
+
+                    x = temp_x;
+                    y = temp_y;
+                } 
+            }
+
+            temp_x += 1;
+        }
+
+        temp_x -= 3;
+        temp_y += 1;
+        if in_bounds?(temp_x, temp_y) {
+            int temp_cost = closed.at(temp_y).at(temp_x);
+
+            ifnot temp_cost {
+                return maze';
+            } elseif temp_cost < last_cost {
+                last_cost = temp_cost;
+
+                x = temp_x;
+                y = temp_y;
+            } elseif (temp_cost == last_cost) & (heuristic(temp_x, temp_y) > heuristic(x, y)) {
+                last_cost = temp_cost;
+
+                x = temp_x;
+                y = temp_y;
+            }
+        }
+        temp_x += 2;
+        if in_bounds?(temp_x, temp_y) {
+            int temp_cost = closed.at(temp_y).at(temp_x);
+
+            ifnot temp_cost {
+                return maze';
+            } elseif temp_cost < last_cost {
+                last_cost = temp_cost;
+
+                x = temp_x;
+                y = temp_y;
+            } elseif (temp_cost == last_cost) & (heuristic(temp_x, temp_y) > heuristic(x, y)) {
+                last_cost = temp_cost;
+
+                x = temp_x;
+                y = temp_y;
+            }
+        }
+
+        temp_x -= 2;
+        temp_y += 1;
+
+        repeat 3 {
+            if in_bounds?(temp_x, temp_y) {
+                int temp_cost = closed.at(temp_y).at(temp_x);
+
+                ifnot temp_cost {
+                    return maze';
+                } elseif temp_cost < last_cost {
+                    last_cost = temp_cost;
+
+                    x = temp_x;
+                    y = temp_y;
+                } elseif (temp_cost == last_cost) & (heuristic(temp_x, temp_y) > heuristic(x, y)) {
+                    last_cost = temp_cost;
+
+                    x = temp_x;
+                    y = temp_y;
+                }
+            }
+
+            temp_x += 1;
+        }
+
+
+        tuple row = maze'.at(y);
+        row~set_index(x, "!"u);
+        maze'~set_index(y, row);
+    }
+
+    return null();
+}
+
+tuple initialize_closed(int rows, int columns) inline {
+    tuple row = empty_tuple();
+    repeat columns {
+        row~tpush(INTEGER_MAX);
+    }
+
+    tuple result = empty_tuple();
+    repeat rows {
+        result~tpush(row);
+    }
+
+    ;; Set start coordinates Final cost to zero.
+    row~set_index(start_x, 0);
+    result~set_index(start_y, row);
+
+    return result;
+}
+
+(int, int, int, tuple) solve(int n, int m, tuple _maze) method_id {
+    ;; Initializing globals
+    rows = n;
+    columns = m;
+    maze = _maze;
+
+    ;; `locate` could definitely be more optimized for a leaderboard scenario,
+    ;; however it really doesn't matter that much for learning,
+    ;; as it only executes twice in the start.
+    (start_x, start_y) = locate(rows, columns, maze, START);
+    (end_x, end_y) = locate(rows, columns, maze, END);
+
+    closed = initialize_closed(rows, columns);
+    open = new_dict();
+
+    heap_push(start_x, start_y, 0, 0);
+
+    while true {
+        ;; No need to check if the priority queue is empty,
+        ;; because in the advanced version there is always a path.
+
+        (int current_x, int current_y, int g_cost, int final_cost) = heap_pop();
+
+        ;; In A*,
+        ;; whenever end coordinates are at the top of the queue
+        ;; it means the most optimal path has been found.
+        if (current_x == end_x) & (current_y == end_y) {
+            tuple maze' = solved_maze();
+
+            ;; This is also taken from justdmitry's solution:
+            ;; https://github.com/justdmitry/tsc5
+            ;; Quite smart.
+            (int obstacles_passed, int suplen) = divmod(g_cost, OBSTACLE_COST);
+            (int superpositions_passed, int path_length) = divmod(suplen, SUPERPOSITION_COST);
+
+            return (obstacles_passed, superpositions_passed, path_length, maze');
+        }
+
+        {-
+            Goes through neighbors of the current node
+            and pushes them to the priority queue
+            if their cost is cheaper than the already present in the `closed` matrix.
+
+            For ease of understanding:
+            What this does is offsets the current coordinates
+            to the left and top by one,
+            then checks the next three coordinates in the row,
+            then goes down one, checks the left and right coordinates
+            to the given coordinate,
+            then goes down and looks at the bottom row.
+
+            To visualize this order of operation:
+            (where 0 is current coordinates)
+            1 2 3
+            4 0 6
+            7 8 9
+
+            `g_cost` is incremented as that's the G cost a neighbor should have.
+            (without extra costs)
+        -}
+        g_cost += 1;
+        current_y -= 1;
+        current_x -= 1;
+
+        repeat 3 {
+            _neighbor(current_x, current_y, g_cost);
+
+            current_x += 1;
+        }
+
+        current_x -= 3;
+        current_y += 1;
+        _neighbor(current_x, current_y, g_cost);
+        _neighbor(current_x + 2, current_y, g_cost);
+
+        current_y += 1;
+
+        repeat 3 {
+            _neighbor(current_x, current_y, g_cost);
+
+            current_x += 1;
+        }
+    }
+
+    return (0, 0, 0, null());
+}
+

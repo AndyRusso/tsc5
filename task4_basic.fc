@@ -1,0 +1,413 @@
+#include "imports/stdlib.fc";
+forall X -> int tuple?(X t) asm "ISTUPLE";
+int tlen(tuple t) asm "TLEN";
+forall X -> (tuple, ()) set_index(tuple t, int index, X value) asm(t value index) "SETINDEXVAR";
+;;; Adds an element to the beginning of lisp-style list.
+forall X -> (tuple, ()) ~push(tuple tail, X head) asm "CONS";
+
+;;; Extracts the head and the tail of lisp-style list.
+forall X -> (tuple, (X)) ~pop(tuple list) asm "UNCONS";
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+
+}
+
+global int start_x;
+global int start_y;
+global int end_x;
+global int end_y;
+global int rows;
+global int columns;
+global tuple maze;
+;; Lisp-style-list of Nodes to expand.
+global tuple open;
+{-
+    Matrix containing visited Nodes.
+    A matrix (tuple of tuples) because it allows for very cheap reads.
+-}
+global tuple closed;
+
+const START = "S"u;
+const END = "E"u;
+const FREE = "."u;
+const OBSTACLE = "X"u;
+const SUPERPOSITION_OBSTACLE = "?"u;
+
+(int, int) locate(int rows, int columns, tuple maze, int char) {
+    int row = 0;
+    repeat rows {
+        int column = 0;
+        repeat columns {
+            if maze.at(row).at(column) == char {
+                return (column, row);
+            }
+
+            column += 1;
+        }
+
+        row += 1;
+    }
+
+    return (-1, -1);
+}
+
+{-
+    The heuristic used for this maze is Chebyshev distance:
+    https://wikipedia.org/wiki/Chebyshev_distance .
+    This can be quite easily understood as the appropirate heuristic,
+    by looking at the provided examples of solved mazes
+    in the task description.
+
+    Another curious thing I've observed is why this formula is the way it is.
+    According to this article: 
+    https://theory.stanford.edu/~amitp/GameProgramming/Heuristics.html#diagonal-distance
+    The formula for Chebyshev distance could be:
+    heuristic = D * (dx + dy) + (D2 - 2 * D) * min(dx, dy)
+    But Wikipedia's is closer to my implementation.
+    Well, this equation can be transformed in our case:
+    heuristic = 1 * (dx + dy) + (1 - 2 * 1) * min(dx, dy)
+    heuristic = (dx + dy) - min(dx, dy)
+    heuristic = max(dx, dy)
+-}
+int heuristic(int node_x, int node_y) {
+    int dx = abs(node_x - end_x);
+    int dy = abs(node_y - end_y);
+
+    return max(dx, dy);
+}
+
+{-
+    [ int x, int y, int g_cost, int final_cost, [ int x, int y ] parent ] = Node
+    These constants represent indexes of values for the Node tuple.
+-}
+const int X = 0;
+const int Y = 1;
+const int G_COST = 2;
+const int FINAL_COST = 3;
+const int PARENT = 4;
+
+;; Huge number to prefer free spaces over superpositions.
+const int SUPERPOSITION_COST = 10000;
+
+[int, int, int, int, tuple] new_node(int x, int y, int g_cost, tuple parent) {
+    return [
+        x,
+        y,
+        g_cost,
+        g_cost + heuristic(x, y),
+        parent
+    ];
+}
+
+{-
+    Puts a Node in the closed matrix at its coordinates.
+-}
+(tuple, ()) close(tuple closed, tuple node) {
+    int y = node.at(Y);
+
+    tuple row = closed.at(y);
+    row~set_index(node.at(X), node);
+    closed~set_index(y, row);
+
+    return (closed, ());
+}
+
+{-
+    Checks if a Node is in the closed matrix.
+    If it is then it shouldn't be processed again.
+
+    Because `closed` is initialized as a copy of the maze,
+    unchanged coordinates will be ints, not tuples.
+-}
+int closed?(int x, int y) {
+    return closed.at(y).at(x).tuple?();
+}
+
+{-
+    Works like popping from a priority queue.
+    Very inefficient, of course, since it goes over all the elements.
+    Also adds the Node to the closed list,
+    since its neighbors will be explored right after.
+-}
+(tuple, (tuple, tuple)) ~node_lowest_cost(tuple open, tuple closed) {
+    tuple new_open = null();
+    tuple open_copy = open;
+    tuple lowest_cost = open_copy~pop();
+
+    if ~ open_copy.null?() {
+        do {
+            tuple temp = open_copy~pop();
+
+            if temp.at(FINAL_COST) < lowest_cost.at(FINAL_COST) {
+                lowest_cost = temp;
+            }
+        } until open_copy.null?();
+
+        int lowest_cost_x = lowest_cost.at(X);
+        int lowest_cost_y = lowest_cost.at(Y);
+        do {
+            tuple temp = open~pop();
+
+            if (temp.at(X) != lowest_cost_x) | (temp.at(Y) != lowest_cost_y) {
+                new_open~push(temp);
+            }
+        } until open.null?();
+    }
+
+    closed~close(lowest_cost);
+
+    return (new_open, (lowest_cost, closed));
+}
+
+{-
+    Checks if a Node is present in the open list,
+    and if it is returns it.
+    This is needed to check if
+    a new Node provides a shorter path
+    to a Node that is already in the open list.
+    If it's shorter,
+    the algorithm will replace the old longer version
+    with the new shorter version later.
+-}
+(tuple, int) get_node?(int x, int y) {
+    tuple open_copy = open;
+    while ~ open_copy.null?() {
+        tuple node = open_copy~pop();
+        if (node.at(X) == x) & (node.at(Y) == y) {
+            return (node, true);
+        }
+    }
+
+    return (null(), false);
+}
+
+(int, int) walkable(int x, int y) {
+    int char = maze.at(y).at(x);
+    int superposition? = char == SUPERPOSITION_OBSTACLE;
+    return ((char == FREE) | (char == END) | superposition?, superposition?);
+}
+
+int in_bounds?(int x, int y) {
+    return (x >= 0) & (x < columns) & (y >= 0) & (y < rows);
+}
+
+(tuple, ()) ~_neighbor(tuple neighbors, int x, int y, int g_cost, tuple parent) {
+    if in_bounds?(x, y) {
+        (int walkable?, int superposition?) = walkable(x, y);
+        if walkable? {
+            ifnot closed?(x, y) {
+                neighbors~tpush(
+                    new_node(
+                        x,
+                        y,
+                        g_cost + (superposition? ? SUPERPOSITION_COST : 0),
+                        parent
+                    )
+                );
+            }
+        }
+    }
+
+    return (neighbors, ());
+}
+
+{-
+    Looks at neighbors of a given Node,
+    and returns a tuple of them.
+    The tuple only contains valid Nodes
+    that are in bounds of the maze.
+
+    For ease of understanding:
+    What this does is offsets the given coordinates
+    to the left and top by one,
+    then checks the next three coordinates in the row,
+    then goes down one, checks the left and right coordinates
+    to the given coordinate,
+    then goes down and looks at the bottom row.
+
+    To visualize this order of operation:
+    (where 0 is given coordinate)
+    1 2 3
+    4 0 6
+    7 8 9
+
+    `g_cost` is the cost that the neighbor Node should have.
+-}
+tuple neighbors(tuple node) {
+    int g_cost = node.at(G_COST) + 1;
+
+    int temp_x = node.at(X) - 1;
+    int temp_y = node.at(Y) - 1;
+
+    tuple neighbors = empty_tuple();
+    repeat 3 {
+        neighbors~_neighbor(temp_x, temp_y, g_cost, node);
+
+        temp_x += 1;
+    }
+
+    temp_x -= 3;
+    temp_y += 1;
+    neighbors~_neighbor(temp_x, temp_y, g_cost, node);
+    neighbors~_neighbor(temp_x + 2, temp_y, g_cost, node);
+
+    temp_y += 1;
+
+    repeat 3 {
+        neighbors~_neighbor(temp_x, temp_y, g_cost, node);
+
+        temp_x += 1;
+    }
+
+    return neighbors;
+}
+
+{-
+    Function that marks a given coordinate in the maze with a "!".
+    Also checks if the coordinate is a superposition.
+
+    This should really be implemented via "SETINDEXVAR".
+-}
+(tuple, (int)) ~replace_maze(tuple maze, x, y) {
+    tuple new_maze = empty_tuple();
+
+    int new_y = 0;
+    int crossed_superposition = 0;
+    repeat rows {
+        int new_x = 0;
+        if new_y == y {
+            tuple row = empty_tuple();
+            tuple current_row = maze.at(new_y);
+
+            repeat columns {
+                if new_x == x {
+                    if current_row.at(new_x) == "?"u {
+                        crossed_superposition = 1;
+                    }
+
+                    row~tpush("!"u);
+                } else {
+                    row~tpush(current_row.at(new_x));
+                }
+
+                new_x += 1;
+            }
+
+            new_maze~tpush(row);
+        } else {
+            new_maze~tpush(maze.at(new_y));
+        }
+
+        new_y += 1;
+    }
+
+    return (new_maze, (crossed_superposition));
+}
+
+{-
+    Goes through every parent of the end Node,
+    marks the path on the maze,
+    until it reaches the parent node.
+    Along the way keeps count of the passed superpositions and length.
+    Length starts with 1 because the end is counted as a step.
+    The path length is amount of "!" + 1.
+-}
+(tuple, int, int) solved_maze(tuple end_node) {
+    tuple parent = end_node.at(PARENT);
+    if (parent.at(X) == start_x) & (parent.at(Y) == start_y) {
+        return (maze, 1, 0);
+    }
+    int path_length = 1;
+    int superpositions_passed = 0;
+    tuple solved_maze = maze;
+
+    do {
+        superpositions_passed += solved_maze~replace_maze(parent.at(X), parent.at(Y));
+
+        parent = parent.at(PARENT);
+        path_length += 1;
+    } until (parent.at(X) == start_x) & (parent.at(Y) == start_y);
+
+    return (solved_maze, path_length, superpositions_passed);
+}
+
+(int, int, int, tuple) solve(int n, int m, tuple _maze) method_id {
+    ;; Was used for local testing but forgot to remove.
+    set_gas_limit(1 << 250);
+
+    ;; Globals initialization.
+    rows = n;
+    columns = m;
+    maze = _maze;
+
+    int superpositions = int path_length = 0;
+
+    (start_x, start_y) = locate(rows, columns, maze, "S"u);
+    (end_x, end_y) = locate(rows, columns, maze, "E"u);
+
+    open = null();
+    closed = maze;
+
+    open~push(
+        new_node(
+            start_x,
+            start_y,
+            0,
+            null()
+        )
+    );
+
+    while true {
+        ;; If there're no more coordinates to explore
+        ;; it means there is no solution to this maze.
+        if open.null?() {
+            return (-1, 0, 0, null());
+        }
+
+        (tuple current, closed) = open~node_lowest_cost(closed);
+        int current_x = current.at(X);
+        int current_y = current.at(Y);
+
+        ;; In A*,
+        ;; whenever end coordinates are at the top of the queue
+        ;; it means the most optimal path has been found.
+        if (current_x == end_x) & (current_y == end_y) {
+            (maze, path_length, superpositions) = solved_maze(current);
+
+            return (-1, superpositions, path_length, maze);
+        } else {
+            tuple neighbors = neighbors(current);
+
+            int i = 0;
+            repeat neighbors.tlen() {
+                tuple neighbor = neighbors.at(i);
+                var (old_neighbor, success) = get_node?(neighbor.at(X), neighbor.at(Y));
+
+                if success {
+                    ;; If it's cheaper to go through the new neighbor,
+                    ;; replace the old one.
+                    if neighbor.at(FINAL_COST) < old_neighbor.at(FINAL_COST) {
+                        tuple end = null();
+
+                        int old_neighbor_x = old_neighbor.at(X);
+                        int old_neighbor_y = old_neighbor.at(Y);
+                        while ~ open.null?() {
+                            tuple temp = open~pop();
+                            if (temp.at(X) != old_neighbor_x) | (temp.at(Y) != old_neighbor_y) {
+                                end~push(temp);
+                            }
+                        }
+
+                        open = end;
+                    }
+                } else {
+                    open~push(neighbor);
+                }
+
+                i += 1;
+            }
+        }
+    }
+
+    return (-1, 0, 0, null());
+}
